@@ -2,7 +2,7 @@
 
 **Real-time acoustic hazard detection for pedestrian safety using a CNN-based deep learning pipeline with confidence-based hazard assessment.**
 
-> Built for Final Year Projects, IEEE Publication, Smart India Hackathon, and MSME Innovation.
+
 
 ---
 

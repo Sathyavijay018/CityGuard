@@ -107,6 +107,25 @@ Windows convenience command:
 run_app.bat
 ```
 
+## Vercel browser demo
+
+The `web/` folder is a static browser MVP for Vercel. It supports microphone capture
+and uploaded audio without a Python server. Deploy the repository to Vercel with the
+default settings; `vercel.json` routes the site to `web/index.html`.
+
+The browser build performs real client-side audio feature analysis and acoustic-risk
+assessment. It does not load the Keras CNN directly because Keras models require
+conversion to a browser format or a separate inference API. Use the Streamlit app for
+the exact trained CNN inference until that deployment step is added.
+
+Local preview:
+
+```bash
+python -m http.server 4173
+```
+
+Then open `http://localhost:4173/web/`.
+
 ## File analysis mode
 
 The app supports uploading a WAV/MP3/FLAC/OGG file. The same preprocessing and model inference pipeline is used for recorded input, with a simple timeline and spectrogram view.

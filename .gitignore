@@ -1,0 +1,15 @@
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+
+# Local datasets are kept outside version control.
+data/raw/
+vehicle/
+non_vehicle/
+synthetic_data/
+
+# Generated training artifacts.
+models/*.best.keras
+models/cityguard_crnn.keras
+results/metadata.json

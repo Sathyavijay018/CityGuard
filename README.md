@@ -1,229 +1,141 @@
-# 🚨 CityGuard — AI-Powered Pedestrian Safety Assistant
+# CityGuard
 
-**Real-time acoustic hazard detection for pedestrian safety using a CNN-based deep learning pipeline with confidence-based hazard assessment.**
+CityGuard is a lightweight pedestrian safety MVP that listens to environmental audio, extracts log-Mel features, and classifies audio into two classes: vehicle and non-vehicle.
 
+The prototype is intentionally simple and transparent: it prioritizes trustworthy local inference, clear state reporting, and safe alert logic over complex dashboards or cloud integrations.
 
+## Purpose
 
----
+The target use case is a pedestrian who may be distracted while walking and may miss a nearby vehicle sound. The microphone-based prototype tries to recognize important vehicle sounds from environmental audio and raise a cautious alert only after persistent evidence.
 
-## Architecture Overview
+## Architecture
 
-```
-┌─────────────┐
-│  Microphone │
-└──────┬──────┘
-       │ Raw audio chunks (0.5s)
-       ▼
-┌─────────────────────┐
-│  Sliding Window      │  2.0s overlapping buffer
-│  (preprocessing/)    │  prevents boundary misses
-└──────┬──────────────┘
-       │
-       ▼
-┌─────────────────────┐
-│  Audio Preprocessing │  Normalize → Noise Reduction
-│  (preprocessing/)    │  → Band-pass Filter
-└──────┬──────────────┘
-       │
-       ▼
-┌─────────────────────┐
-│  Mel Spectrogram     │  128 mel bands × 86 frames
-│  (preprocessing/)    │  Log-scaled, NumPy STFT
-└──────┬──────────────┘
-       │  (128, 86, 1)
-       ▼
-┌─────────────────────┐
-│  CNN Classifier      │  Conv2D(32→64→128) + BN
-│  (models/)           │  + MaxPool → GAP → Dense
-└──────┬──────────────┘
-       │  8-class softmax
-       ▼
-┌─────────────────────┐
-│  Hazard Assessment   │  Confidence + Consecutive
-│  (hazard_assessment/)│  + Stability + Consistency
-└──────┬──────────────┘
-       │  hazard_score (0-1)
-       ▼
-┌─────────────────────┐
-│  Three-Level Alert   │  Level 1: Warning (Yellow)
-│  System              │  Level 2: Approaching (Orange)
-│                      │  Level 3: Emergency (Red)
-└─────────────────────┘
-```
+- Audio capture via microphone or uploaded file
+- Mono conversion and resampling to 16 kHz
+- 2.0 s sliding window with 0.5 s step
+- Log-Mel spectrogram using 128 bins and 1024 FFT
+- CNN baseline or CNN-GRU model
+- Binary softmax classification: `vehicle` / `non_vehicle`
+- Acoustic-risk engine using persistence, measured energy change, and dominant-frequency change
+- Minimal Streamlit interface
 
----
+## Binary taxonomy
 
-## Sound Classes (8)
+- `non_vehicle`
+- `vehicle`
 
-| # | Class | Description |
-|---|-------|-------------|
-| 1 | `car_horn` | Car horn / automobile beep |
-| 2 | `bike_horn` | Two-wheeler electronic horn |
-| 3 | `truck_horn` | Heavy vehicle air horn |
-| 4 | `ambulance_siren` | Ambulance wailing siren |
-| 5 | `police_siren` | Police yelp siren |
-| 6 | `fire_engine_siren` | Fire truck priority siren |
-| 7 | `tire_screech` | Tire skid / brake noise |
-| 8 | `background_noise` | Ambient / silence |
+## Folder structure
 
----
-
-## Key Innovation — Confidence-Based Hazard Assessment
-
-Instead of triggering alerts from a single prediction, CityGuard computes a **composite hazard score** from four signals:
-
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| Prediction Confidence | 30% | CNN softmax probability |
-| Consecutive Detections | 25% | Hazard predictions in a row |
-| Temporal Stability | 25% | Same class across recent predictions |
-| Window Consistency | 20% | Fraction of hazard predictions in window |
-
-Alerts fire only when the score exceeds a dynamic threshold, with a cooldown period. This **dramatically reduces false positives** while maintaining responsiveness.
-
----
-
-## Three-Level Alert System
-
-| Level | Label | Color | Trigger |
-|-------|-------|-------|---------|
-| 1 | Vehicle Nearby | 🟡 Yellow | Hazard score ≥ 0.35 |
-| 2 | Vehicle Approaching | 🟠 Orange | Score ≥ 0.35 + 3 consecutive |
-| 3 | Immediate Danger | 🔴 Red | Hazard score ≥ 0.65 |
-
----
+- `app.py` — Streamlit demo interface
+- `audio_processor.py` — microphone streaming helper
+- `config.py` — centralized config
+- `create_dummy_data.py` — explicitly synthetic binary development dataset generator
+- `model_trainer.py` — training pipeline
+- `verify_setup.py` — environment validation
+- `preprocessing/` — shared audio and Mel preprocessing
+- `models/` — saved model(s)
+- `hazard_assessment/` — temporal alert logic
+- `tests/` — critical pipeline tests
+- `results/` — evaluation outputs from experiments
+- `data/` — raw and processed dataset folders
 
 ## Installation
 
-### Prerequisites
-- Python 3.9+
-- Working microphone
-- On Linux: `sudo apt-get install libsndfile1 portaudio19-dev`
-
-### Setup
-
 ```bash
-cd SoundClassifier
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Linux / macOS
-source venv/bin/activate
-
-pip install -r requirements.txt
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-### Generate Training Data
+## Dataset preparation
+
+The active MVP uses the supplied binary dataset:
+
+- `non_vehicle/`
+- `vehicle/`
+
+These folders may be placed at the project root, as in the current dataset, or under another directory passed with `--data-dir`.
+
+The project also supports a development-only synthetic generator:
 
 ```bash
-python create_dummy_data.py --samples 100
+python create_dummy_data.py --samples 20 --out synthetic_data
 ```
 
-For production, replace the synthetic files in `data/` with real recordings and re-run.
+Important rules:
 
-### Train the CNN
+- Do not mix recordings from the same source file across train/test splits.
+- Segments from the same original recording must never appear in both training and validation/test sets.
+- Augment training data only; do not augment validation or test data.
+- Synthetic audio should be treated as a development utility, not real-world validation.
+
+## Training
+
+Training the baseline CNN:
 
 ```bash
-python model_trainer.py --epochs 20
+python model_trainer.py --model cnn --data-dir .
 ```
 
-This produces:
-- `models/cityguard_cnn.keras` — trained Keras model
-- `models/metadata.json` — evaluation metrics, class names, training history
+Training the CNN-GRU variant:
 
-### Run the Dashboard
+```bash
+python model_trainer.py --model crnn --data-dir .
+```
+
+## Evaluation
+
+```bash
+python model_trainer.py --model cnn --data-dir .
+python model_trainer.py --model crnn --data-dir .
+```
+
+The evaluation pipeline saves metrics in `results/` and should report real measured values only.
+
+## Running the MVP
+
+Launch the Streamlit app:
 
 ```bash
 streamlit run app.py
 ```
 
----
+Windows convenience command:
 
-## Folder Structure
-
-```
-SoundClassifier/
-├── app.py                        # Streamlit dashboard (main entry point)
-├── audio_processor.py            # Queue-based mic streaming (preserved)
-├── config.py                     # Centralised audio/model/hazard config
-├── model_trainer.py              # CNN training pipeline
-├── create_dummy_data.py          # Synthetic 8-class data generator
-├── feature_extraction.py         # Legacy feature extractor (kept for reference)
-├── requirements.txt              # Python dependencies
-├── style.css                     # Glassmorphism UI theme
-│
-├── preprocessing/                # Audio preprocessing package
-│   ├── __init__.py
-│   ├── audio.py                  # Noise reduction, normalization, filtering
-│   └── mel_spectrogram.py        # Mel spectrogram + sliding window buffer
-│
-├── models/                       # Trained model & architecture
-│   ├── __init__.py
-│   ├── cnn_model.py              # CNN definition & inference helpers
-│   ├── cityguard_cnn.keras       # (generated) trained model
-│   └── metadata.json             # (generated) evaluation results
-│
-├── hazard_assessment/            # Core innovation module
-│   ├── __init__.py
-│   └── hazard_engine.py          # Hazard scoring + three-level alerts
-│
-├── utils/                        # Utility helpers
-│   ├── __init__.py
-│   └── visualization.py          # Streamlit HTML rendering
-│
-├── data/                         # Training audio files (WAV)
-│   ├── car_horn/
-│   ├── bike_horn/
-│   ├── truck_horn/
-│   ├── ambulance_siren/
-│   ├── police_siren/
-│   ├── fire_engine_siren/
-│   ├── tire_screech/
-│   └── background_noise/
-│
-└── logs/                         # Runtime logs
+```bat
+run_app.bat
 ```
 
----
+## File analysis mode
 
-## Evaluation Metrics
+The app supports uploading a WAV/MP3/FLAC/OGG file. The same preprocessing and model inference pipeline is used for recorded input, with a simple timeline and spectrogram view.
 
-After training, the following metrics are available on the **Model Info** page:
+## Verification
 
-- **Accuracy** — overall classification accuracy
-- **F1 Score** — weighted F1 across all classes
-- **Confusion Matrix** — interactive Plotly heatmap
-- **False Positive Rate** — per-class FPR bar chart
-- **Training Curves** — loss and accuracy over epochs
+```bash
+python verify_setup.py
+```
 
----
+The script checks:
 
-## Performance Optimisations
+- Python version
+- dependency availability
+- TensorFlow import
+- model presence
+- class mapping
+- preprocessing
+- microphone availability where possible
 
-| Technique | Benefit |
-|-----------|---------|
-| Pure NumPy STFT | No librosa dependency at inference time |
-| Pre-computed mel filter-bank | O(n_mels × n_freqs) matrix multiply |
-| Sliding window buffer | No redundant audio re-processing |
-| Global Average Pooling | Fewer parameters than Flatten + Dense |
-| Early stopping + LR scheduling | Efficient training convergence |
-| Lightweight preprocessing | Skips heavy noise reduction for latency |
+## Limitations
 
----
+- Single microphone only
+- No physical distance estimation: “HIGH ACOUSTIC RISK” is only a measured-audio proxy, not a distance claim
+- No guaranteed approach-direction estimation
+- Performance depends on dataset quality and environment
+- Overlapping or unusual sounds may affect predictions
+- Prototype requires real-world field validation before claiming operational readiness
 
-## Future Enhancements
+## Research use
 
-- [ ] TensorFlow Lite deployment for mobile / edge devices
-- [ ] YAMNet fine-tuning as an alternative backbone
-- [ ] Real-world dataset integration (Freesound, ESC-50)
-- [ ] GPS-based location tagging for alerts
-- [ ] Bluetooth haptic feedback for wearable devices
-- [ ] Federated learning for crowd-sourced model improvement
-
----
-
-## License
-
-This project is developed for academic and research purposes.
+This repository is suitable for comparing a CNN baseline against a lightweight CNN-GRU model under the same binary dataset split. Keep experiments reproducible and report real measured metrics only.

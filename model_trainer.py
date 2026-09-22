@@ -1,62 +1,40 @@
-"""Train the CityGuard CNN on mel-spectrogram data.
-
-Usage
------
-    python model_trainer.py                # train with default settings
-    python model_trainer.py --epochs 30    # override hyper-parameters
-
-The script auto-discovers every sub-folder under ``data/`` and treats each
-folder name as a class label.  It produces:
-
-* ``models/cityguard_cnn.keras``  — trained Keras model
-* ``models/metadata.json``         — class names, metrics, training history
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
-import time
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
 
-# ------------------------------------------------------------------ #
-# Ensure local package imports work when run as a script
-# ------------------------------------------------------------------ #
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from config import AUDIO, MODEL, CLASS_NAMES
-from preprocessing.mel_spectrogram import MelSpectrogramComputer
+from config import AUDIO, CLASS_NAMES, MODEL
+from models.cnn_model import build_cnn_model, build_crnn_model
 from preprocessing.audio import preprocess_audio
-from models.cnn_model import build_cnn_model
-
-# Suppress TF info-level stderr noise on Windows
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+from preprocessing.mel_spectrogram import MelSpectrogramComputer
 
 
-# ------------------------------------------------------------------ #
-# Data loading
-# ------------------------------------------------------------------ #
+def _pad_or_trim_mel(mel: np.ndarray, target_width: int = AUDIO.MEL_WIDTH) -> np.ndarray:
+    mel = np.asarray(mel, dtype=np.float32)
+    if mel.ndim != 2:
+        raise ValueError(f"Expected a 2D mel spectrogram, got shape {mel.shape}.")
+    if mel.shape[1] >= target_width:
+        mel = mel[:, :target_width]
+    else:
+        pad = target_width - mel.shape[1]
+        mel = np.pad(mel, ((0, 0), (0, pad)), mode="constant")
+    return mel
 
-def load_dataset(
-    base_dir: str = "data",
-    target_width: int = AUDIO.MEL_WIDTH,
-    augment: bool = True,
-    augment_factor: int = MODEL.AUGMENTATION_FACTOR,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Load audio files, compute mel spectrograms, and optionally augment.
 
-    Returns
-    -------
-    X : ndarray, shape ``(N, n_mels, T, 1)``
-    y : ndarray of integer labels
-    class_names : list of class label strings (sorted alphabetically)
-    """
-    import soundfile as sf
+def load_dataset(data_dir: str = ".") -> tuple[np.ndarray, np.ndarray, list[str]]:
+    data_path = Path(data_dir)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {data_path}")
 
+    X: list[np.ndarray] = []
+    y: list[int] = []
     computer = MelSpectrogramComputer(
         sr=AUDIO.SAMPLE_RATE,
         n_fft=AUDIO.N_FFT,
@@ -66,284 +44,173 @@ def load_dataset(
         fmax=AUDIO.FMAX,
     )
 
-    # Discover classes — only use folders that match CLASS_NAMES
-    all_dirs = sorted([
-        d for d in os.listdir(base_dir)
-        if os.path.isdir(os.path.join(base_dir, d))
-    ])
-    class_dirs = sorted([d for d in all_dirs if d in CLASS_NAMES])
-    ignored = [d for d in all_dirs if d not in CLASS_NAMES]
-    if ignored:
-        print(f"Ignoring legacy folders: {ignored}")
-    if not class_dirs:
-        raise FileNotFoundError(f"No valid class sub-folders found in '{base_dir}/'")
+    for class_id, class_name in enumerate(CLASS_NAMES):
+        class_dir = data_path / class_name
+        if not class_dir.exists():
+            continue
+        for wav_path in sorted(class_dir.glob("*.wav")):
+            audio, sr = sf.read(wav_path, dtype="float32")
+            audio = preprocess_audio(audio, sr=sr, target_sr=AUDIO.SAMPLE_RATE, window_length=int(AUDIO.SAMPLE_RATE * AUDIO.WINDOW_DURATION))
+            mel = computer.compute(audio)
+            mel = _pad_or_trim_mel(mel, target_width=AUDIO.MEL_WIDTH)
+            X.append(mel[..., np.newaxis])
+            y.append(class_id)
 
-    print(f"Discovered {len(class_dirs)} classes: {class_dirs}")
+    if not X:
+        raise FileNotFoundError(f"No audio files were found under {data_path}")
 
-    X_list: list[np.ndarray] = []
-    y_list: list[int] = []
-
-    for label_idx, class_name in enumerate(class_dirs):
-        class_path = os.path.join(base_dir, class_name)
-        wav_files = sorted(Path(class_path).glob("*.wav"))
-        print(f"  [{class_name}] {len(wav_files)} files")
-
-        for fpath in wav_files:
-            try:
-                audio, sr = sf.read(str(fpath), dtype="float32")
-                if audio.ndim > 1:
-                    audio = audio.mean(axis=1)
-                if sr != AUDIO.SAMPLE_RATE:
-                    # Simple resample via interpolation
-                    ratio = AUDIO.SAMPLE_RATE / sr
-                    new_len = int(len(audio) * ratio)
-                    audio = np.interp(
-                        np.linspace(0, len(audio), new_len),
-                        np.arange(len(audio)),
-                        audio,
-                    ).astype(np.float32)
-
-                audio = preprocess_audio(audio, sr=AUDIO.SAMPLE_RATE)
-                mel = computer.compute(audio)
-                mel = _pad_or_trim(mel, target_width)
-                X_list.append(mel)
-                y_list.append(label_idx)
-
-                # Augmentation
-                if augment:
-                    for _ in range(augment_factor):
-                        aug_audio = _augment(audio)
-                        aug_mel = computer.compute(aug_audio)
-                        aug_mel = _pad_or_trim(aug_mel, target_width)
-                        X_list.append(aug_mel)
-                        y_list.append(label_idx)
-            except Exception as e:
-                print(f"    Skipping {fpath.name}: {e}")
-
-    X = np.array(X_list)[..., np.newaxis]  # add channel dim
-    y = np.array(y_list)
-    print(f"Dataset: {X.shape[0]} samples, shape {X.shape[1:]}")
-    return X, y, class_dirs
+    return np.stack(X, axis=0).astype(np.float32), np.asarray(y, dtype=np.int32), CLASS_NAMES
 
 
-def _pad_or_trim(mel: np.ndarray, width: int) -> np.ndarray:
-    """Ensure the time axis equals *width*."""
-    T = mel.shape[1]
-    if T >= width:
-        return mel[:, :width]
-    return np.pad(mel, ((0, 0), (0, width - T)), mode="constant")
+def _augment_training_mels(X: np.ndarray, y: np.ndarray, copies: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Augment training examples only; validation and test arrays are untouched."""
+    augmented = [X]
+    labels = [y]
+    for copy_index in range(copies):
+        rng = np.random.default_rng(MODEL.RANDOM_SEED + copy_index)
+        noisy = X + rng.normal(0.0, 0.015, size=X.shape).astype(np.float32)
+        shift = int(rng.integers(-4, 5))
+        shifted = np.roll(noisy, shift=shift, axis=2)
+        augmented.append(shifted.astype(np.float32))
+        labels.append(y)
+    return np.concatenate(augmented), np.concatenate(labels)
 
 
-def _augment(audio: np.ndarray) -> np.ndarray:
-    """Lightweight augmentation: noise injection + amplitude scaling + time shift."""
-    aug = audio.copy()
-
-    # Random noise
-    noise_level = np.random.uniform(0.001, 0.015)
-    aug += np.random.randn(len(aug)).astype(np.float32) * noise_level
-
-    # Amplitude scaling
-    aug *= np.random.uniform(0.7, 1.3)
-
-    # Time shift (up to 10 % of length)
-    shift = int(np.random.uniform(-0.1, 0.1) * len(aug))
-    aug = np.roll(aug, shift)
-
-    # Clip to prevent clipping artefacts
-    peak = np.max(np.abs(aug))
-    if peak > 1.0:
-        aug = aug / peak
-
-    return aug
-
-
-# ------------------------------------------------------------------ #
-# Training
-# ------------------------------------------------------------------ #
-
-def train(
-    X: np.ndarray,
-    y: np.ndarray,
-    class_names: list[str],
+def train_model(
+    model_name: str,
     epochs: int = MODEL.EPOCHS,
     batch_size: int = MODEL.BATCH_SIZE,
-    lr: float = MODEL.LEARNING_RATE,
-    val_split: float = MODEL.VALIDATION_SPLIT,
-) -> tuple:
-    """Train the CNN and return ``(model, history)``."""
-    from tensorflow.keras.utils import to_categorical
-    from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+    data_dir: str = ".",
+) -> tuple[tf.keras.Model, dict]:
+    tf.keras.utils.set_random_seed(MODEL.RANDOM_SEED)
+    X, y, names = load_dataset(data_dir)
+    class_counts = np.bincount(y, minlength=len(names))
+    if np.any(class_counts < 2):
+        raise ValueError(
+            "Each class needs at least two source recordings for a stratified validation split. "
+            f"Counts: {dict(zip(names, class_counts.tolist()))}"
+        )
 
-    num_classes = len(class_names)
-    y_cat = to_categorical(y, num_classes=num_classes)
-
-    model = build_cnn_model(
-        input_shape=(AUDIO.MEL_HEIGHT, AUDIO.MEL_WIDTH, 1),
-        num_classes=num_classes,
-        learning_rate=lr,
+    X_train, X_val, y_train_ids, y_val_ids = train_test_split(
+        X,
+        y,
+        test_size=0.25,
+        random_state=MODEL.RANDOM_SEED,
+        stratify=y,
     )
-    model.summary()
+    X_train, y_train_ids = _augment_training_mels(
+        X_train,
+        y_train_ids,
+        copies=MODEL.AUGMENTATION_FACTOR,
+    )
+    y_train = tf.keras.utils.to_categorical(y_train_ids, num_classes=len(names))
+    y_val = tf.keras.utils.to_categorical(y_val_ids, num_classes=len(names))
+
+    if model_name == "cnn":
+        model = build_cnn_model(input_shape=AUDIO.INPUT_SHAPE, num_classes=len(names), learning_rate=MODEL.LEARNING_RATE)
+        save_name = "cityguard_cnn.keras"
+    elif model_name == "crnn":
+        model = build_crnn_model(input_shape=AUDIO.INPUT_SHAPE, num_classes=len(names), learning_rate=MODEL.LEARNING_RATE)
+        save_name = "cityguard_crnn.keras"
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
 
     callbacks = [
-        EarlyStopping(patience=5, restore_best_weights=True, verbose=1),
-        ReduceLROnPlateau(factor=0.5, patience=3, min_lr=1e-6, verbose=1),
+        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", mode="max", patience=8, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-6),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(Path("models") / f"{model_name}.best.keras"),
+            monitor="val_accuracy",
+            mode="max",
+            save_best_only=True,
+        ),
     ]
 
-    print(f"\nTraining for up to {epochs} epochs (batch_size={batch_size}) ...")
-    t0 = time.time()
     history = model.fit(
-        X, y_cat,
+        X_train,
+        y_train,
+        validation_data=(X_val, y_val),
         epochs=epochs,
         batch_size=batch_size,
-        validation_split=val_split,
         callbacks=callbacks,
         verbose=1,
     )
-    elapsed = time.time() - t0
-    print(f"Training completed in {elapsed:.1f}s")
-    return model, history
+
+    model_path = Path("models") / save_name
+    model_path.parent.mkdir(exist_ok=True)
+    model.save(model_path)
+
+    return model, {
+        "history": history.history,
+        "model_name": save_name,
+        "class_names": names,
+        "sample_rate": AUDIO.SAMPLE_RATE,
+        "window_duration": AUDIO.WINDOW_DURATION,
+        "n_mels": AUDIO.N_MELS,
+        "n_fft": AUDIO.N_FFT,
+        "hop_length": AUDIO.HOP_LENGTH,
+        "train_count": int(len(X_train)),
+        "validation_count": int(len(X_val)),
+        "class_counts": dict(zip(names, class_counts.tolist())),
+        "validation_labels": y_val_ids.tolist(),
+    }
 
 
-# ------------------------------------------------------------------ #
-# Evaluation
-# ------------------------------------------------------------------ #
-
-def evaluate(
-    model,
-    X: np.ndarray,
-    y: np.ndarray,
-    class_names: list[str],
-    val_split: float = MODEL.VALIDATION_SPLIT,
-) -> dict:
-    """Compute metrics on the held-out validation set and return a dict."""
-    from sklearn.metrics import (
-        classification_report,
-        confusion_matrix,
-        accuracy_score,
-        f1_score,
+def evaluate_model(model: tf.keras.Model, data_dir: str = ".") -> dict:
+    X, y, names = load_dataset(data_dir)
+    _, X, _, y = train_test_split(
+        X,
+        y,
+        test_size=0.25,
+        random_state=MODEL.RANDOM_SEED,
+        stratify=y,
     )
-
-    n = len(X)
-    split = int(n * (1 - val_split))
-    X_val, y_val = X[split:], y[split:]
-
-    num_classes = len(class_names)
-    y_pred_probs = model.predict(X_val, verbose=0)
-    y_pred = np.argmax(y_pred_probs, axis=1)
-
-    # Use labels param so report works even if some classes are absent in val set
-    label_indices = list(range(num_classes))
-    report = classification_report(
-        y_val, y_pred,
-        labels=label_indices,
-        target_names=class_names,
-        output_dict=True,
-        zero_division=0,
-    )
-    cm = confusion_matrix(y_val, y_pred, labels=label_indices).tolist()
-    acc = accuracy_score(y_val, y_pred)
-    f1 = f1_score(y_val, y_pred, average="weighted", zero_division=0)
-
-    # False positive rate per class
-    fpr = {}
-    for i, name in enumerate(class_names):
-        fp = sum(1 for j, p in enumerate(y_pred) if p == i and y_val[j] != i)
-        tn = sum(1 for j, p in enumerate(y_pred) if p != i and y_val[j] != i)
-        fpr[name] = round(fp / max(fp + tn, 1), 4)
-
-    print(f"\nAccuracy:  {acc:.4f}")
-    print(f"F1 Score:  {f1:.4f}")
-    print("Classification Report:")
-    print(classification_report(
-        y_val, y_pred,
-        labels=label_indices,
-        target_names=class_names,
-        zero_division=0,
-    ))
+    probs = model.predict(X, verbose=0)
+    pred = np.argmax(probs, axis=1)
+    precision, recall, f1, _ = precision_recall_fscore_support(y, pred, labels=list(range(len(names))), average="macro", zero_division=0)
+    acc = accuracy_score(y, pred)
+    weighted_f1 = f1_score(y, pred, average="weighted", zero_division=0)
+    cm = confusion_matrix(y, pred, labels=list(range(len(names)))).tolist()
+    per_class = {
+        names[i]: {
+            "precision": float(precision_recall_fscore_support(y, pred, labels=[i], zero_division=0)[0][0]),
+            "recall": float(precision_recall_fscore_support(y, pred, labels=[i], zero_division=0)[1][0]),
+            "f1": float(precision_recall_fscore_support(y, pred, labels=[i], zero_division=0)[2][0]),
+        }
+        for i in range(len(names))
+    }
 
     return {
-        "accuracy": round(acc, 4),
-        "f1_weighted": round(f1, 4),
-        "classification_report": report,
+        "accuracy": float(acc),
+        "macro_precision": float(precision),
+        "macro_recall": float(recall),
+        "macro_f1": float(f1),
+        "weighted_f1": float(weighted_f1),
+        "per_class": per_class,
         "confusion_matrix": cm,
-        "false_positive_rate": fpr,
+        "classes": names,
     }
 
-
-# ------------------------------------------------------------------ #
-# Save artefacts
-# ------------------------------------------------------------------ #
-
-def save_artefacts(
-    model,
-    history,
-    class_names: list[str],
-    metrics: dict,
-    out_dir: str = "models",
-) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Keras model
-    model_path = os.path.join(out_dir, "cityguard_cnn.keras")
-    model.save(model_path)
-    print(f"Model saved → {model_path}")
-
-    # Metadata JSON
-    meta = {
-        "class_names": class_names,
-        "num_classes": len(class_names),
-        "metrics": metrics,
-        "history": {
-            "loss": [float(v) for v in history.history.get("loss", [])],
-            "accuracy": [float(v) for v in history.history.get("accuracy", [])],
-            "val_loss": [float(v) for v in history.history.get("val_loss", [])],
-            "val_accuracy": [float(v) for v in history.history.get("val_accuracy", [])],
-        },
-        "input_shape": list(AUDIO.INPUT_SHAPE),
-        "sample_rate": AUDIO.SAMPLE_RATE,
-    }
-    meta_path = os.path.join(out_dir, "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"Metadata saved → {meta_path}")
-
-
-# ------------------------------------------------------------------ #
-# Entry point
-# ------------------------------------------------------------------ #
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train CityGuard CNN")
+    parser = argparse.ArgumentParser(description="Train and evaluate the CityGuard models.")
+    parser.add_argument("--model", type=str, default="cnn", choices=["cnn", "crnn"])
     parser.add_argument("--epochs", type=int, default=MODEL.EPOCHS)
     parser.add_argument("--batch-size", type=int, default=MODEL.BATCH_SIZE)
-    parser.add_argument("--lr", type=float, default=MODEL.LEARNING_RATE)
-    parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument("--data-dir", type=str, default=".")
+    parser.add_argument("--evaluate", action="store_true")
     args = parser.parse_args()
 
-    # Load
-    X, y, class_names = load_dataset(
-        base_dir=args.data_dir,
-        augment=not args.no_augment,
-    )
-    if len(X) == 0:
-        print("No training data found. Run create_dummy_data.py first.")
-        return
+    model, info = train_model(args.model, epochs=args.epochs, batch_size=args.batch_size, data_dir=args.data_dir)
+    metadata = {"model": args.model, **info}
+    Path("results").mkdir(exist_ok=True)
+    Path("results/metadata.json").write_text(json.dumps(metadata, indent=2))
 
-    # Train
-    model, history = train(
-        X, y, class_names,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-    )
+    metrics = evaluate_model(model, data_dir=args.data_dir)
+    Path(f"results/{args.model}_metrics.json").write_text(json.dumps(metrics, indent=2))
+    print(json.dumps(metrics, indent=2))
 
-    # Evaluate
-    metrics = evaluate(model, X, y, class_names)
-
-    # Save
-    save_artefacts(model, history, class_names, metrics)
-    print("\nDone.")
+    print(f"Model saved to models/{args.model == 'cnn' and 'cityguard_cnn.keras' or 'cityguard_crnn.keras'}")
 
 
 if __name__ == "__main__":

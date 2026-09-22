@@ -1,5 +1,0 @@
-venv/
-SoundClassifier/venv/
-__pycache__/
-*.pyc
-*.so

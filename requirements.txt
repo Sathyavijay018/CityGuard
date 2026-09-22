@@ -1,0 +1,9 @@
+streamlit>=1.33.0
+tensorflow>=2.14.0,<2.15.0
+numpy>=1.26.0,<2.0.0
+pandas>=2.2.0
+scipy>=1.11.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+scikit-learn>=1.4.0
+plotly>=5.20.0
